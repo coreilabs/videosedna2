@@ -1,0 +1,9 @@
+Projeto Edna Moreira - segunda galeria.
+Os videos desta galeria estao em gallery/ e as capas WebP em thumbnails/.
+1. Adicione videos em gallery/ sem renomear os arquivos antigos.
+2. Gere capas com FFmpeg: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/generate-thumbnails.ps1
+   As capas preservam o quadro inteiro, em WebP de 320 x 570 px (largura maxima de 320 px).
+3. Execute node scripts/generate-catalog.cjs para atualizar videos.json.
+4. Antes de publicar, revise o endereco definitivo da segunda galeria nas tags canonical/Open Graph/Twitter do index.html. O endereco original e a tag Google Analytics foram preservados.
+5. Execute node scripts/version-assets.cjs e publique index.html, app.js, estilos, gallery/, thumbnails/, imgs/ e videos.json.
+Para testar localmente: node scripts/serve.cjs
