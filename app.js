@@ -3,6 +3,7 @@ const $ = id => document.getElementById(id);
 const video = $('video'), viewer = $('viewer');
 let videos = [], filtered = [], rendered = 0, current = -1, lastFocus, toastTimer;
 let shareContext = null, shareBusy = false;
+let playback = null;
 const batch = 24;
 const windowMargin = 1000;
 let galleryGroups = [], resizeTimer, cleanupFrame;
@@ -160,7 +161,11 @@ function updateURL(id) { const url = new URL(location.href); if (id) url.searchP
 function openVideo(index, changeURL = true) {
   if (index < 0 || index >= videos.length) return;
   if (!viewer.open) { lastFocus = document.activeElement; viewer.showModal(); }
-  current = index; const item = videos[index]; video.pause(); video.src = pathURL(item.file); video.poster = item.thumbnail ? thumbnailURL(item.thumbnail) : ''; video.load();
+  playback = null;
+  current = index; const item = videos[index]; video.pause();
+  playback = { item, started: false, active: false, milestones: new Set() };
+  video.src = pathURL(item.file); video.poster = item.thumbnail ? thumbnailURL(item.thumbnail) : ''; video.load();
+  trackPlayback('video_open');
   viewer.setAttribute('aria-label', `Player — ${item.title}`);
   $('seek').value = 0; $('seek').disabled = true; $('time').textContent = '0:00 / 0:00'; $('player-message').textContent = ''; $('big-play').hidden = false;
   $('share-fallback').hidden = true; shareContext = null; $('download').href = pathURL(item.file); $('download').download = item.file.split('/').pop();
@@ -169,6 +174,7 @@ function openVideo(index, changeURL = true) {
   if (changeURL) updateURL(item.id);
 }
 function closeViewer(changeURL = true) {
+  playback = null;
   video.pause(); video.removeAttribute('src'); video.load();
   if (viewer.open) viewer.close();
   if (changeURL) updateURL(null);
@@ -177,7 +183,7 @@ function closeViewer(changeURL = true) {
   scheduleGalleryCleanup();
 }
 function openFromURL() { const id = new URL(location.href).searchParams.get('video'); if (!id) { if (viewer.open) closeViewer(false); return; } const index = videos.findIndex(item => item.id === id); if (index >= 0) openVideo(index, false); else toast('Esta recordação não foi encontrada no álbum.'); }
-async function togglePlay() { if (!video.paused) { video.pause(); return; } try { await video.play(); } catch { $('player-message').textContent = 'Não foi possível reproduzir. Tente novamente ou baixe o vídeo.'; } }
+async function togglePlay() { if (!video.paused) { video.pause(); return; } const context = playback; try { await video.play(); } catch (error) { if (context !== playback) return; trackPlayback('video_error', { error_source: 'play', error_code: error.name }); $('player-message').textContent = 'Não foi possível reproduzir. Tente novamente ou baixe o vídeo.'; } }
 function syncPlay() { const paused = video.paused; $('play').textContent = paused ? '▶ Reproduzir' : 'Ⅱ Pausar'; $('play').setAttribute('aria-label', paused ? 'Reproduzir' : 'Pausar'); $('big-play').hidden = !paused; }
 function trackVideoEvent(name, item, parameters = {}) {
   if (!item || typeof window.gtag !== 'function') return;
@@ -186,8 +192,50 @@ function trackVideoEvent(name, item, parameters = {}) {
       send_to: 'G-K27Z7H0JVY', content_type: 'video', item_id: item.id,
       video_title: item.title, ...parameters
     });
-  } catch { /* Analytics must never interrupt sharing. */ }
+  } catch { /* Analytics must never interrupt the page. */ }
 }
+// Capture the item per opening; ignore queued events from a replaced media source.
+function trackPlayback(name, parameters = {}) {
+  if (!playback || !viewer.open) return;
+  trackVideoEvent(name, playback.item, {
+    video_current_time: Number.isFinite(video.currentTime) ? Math.round(video.currentTime) : 0,
+    video_duration: Number.isFinite(video.duration) ? Math.round(video.duration) : 0,
+    ...parameters
+  });
+}
+function isCurrentMedia() {
+  return playback && viewer.open && video.currentSrc === pathURL(playback.item.file);
+}
+function trackProgress() {
+  if (!isCurrentMedia() || !playback.started || !Number.isFinite(video.duration) || video.duration <= 0) return;
+  const percent = video.currentTime / video.duration * 100;
+  for (const milestone of [25, 50, 75]) {
+    if (percent >= milestone && !playback.milestones.has(milestone)) {
+      playback.milestones.add(milestone);
+      trackPlayback('video_progress', { video_percent: milestone });
+    }
+  }
+}
+// Delegation also covers links/cards recreated by gallery virtualization.
+document.addEventListener('click', event => {
+  const control = event.target.closest('button, a, video');
+  if (!control) return;
+  if (viewer.contains(control)) {
+    if (control.id === 'download') trackPlayback('video_download_click');
+    else trackPlayback('video_control', { control: control.id || 'unknown' });
+  } else if (control.matches('a[href]')) {
+    const url = new URL(control.href, document.baseURI);
+    trackVideoEvent('navigation_click', { id: 'navigation', title: document.title }, {
+      content_type: 'page', link_url: url.href, link_text: control.textContent.trim(),
+      link_type: control.classList.contains('photo-album-link') ? 'album' : 'page'
+    });
+  }
+}, true);
+$('seek').addEventListener('change', () => trackPlayback('video_control', { control: 'seek', video_percent: Number($('seek').value) / 10 }));
+viewer.addEventListener('keydown', event => {
+  if (event.target.matches('input') || !['ArrowRight', 'ArrowLeft', ' ', 'Escape'].includes(event.key)) return;
+  trackPlayback('video_control', { control: 'keyboard', key: event.key });
+});
 function recordShare(context, method) {
   if (!context || context.recorded) return;
   context.recorded = true;
@@ -235,11 +283,26 @@ $('close').addEventListener('click', () => closeViewer()); viewer.addEventListen
 viewer.addEventListener('click', event => { if (event.target === viewer) { const bounds = viewer.getBoundingClientRect(); if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) closeViewer(); } });
 $('play').addEventListener('click', togglePlay); $('big-play').addEventListener('click', togglePlay); video.addEventListener('click', togglePlay);
 video.controls = false;
-video.addEventListener('play', () => { $('player-message').textContent = ''; syncPlay(); }); video.addEventListener('pause', syncPlay); video.addEventListener('ended', syncPlay);
+video.addEventListener('play', () => { $('player-message').textContent = ''; syncPlay(); }); video.addEventListener('pause', () => {
+  syncPlay();
+  if (!isCurrentMedia() || !playback.active || !video.paused || video.ended) return;
+  playback.active = false; trackPlayback('video_pause');
+});
+video.addEventListener('ended', () => {
+  syncPlay();
+  if (!isCurrentMedia() || !playback.started) return;
+  trackProgress(); playback.active = false; trackPlayback('video_complete', { video_percent: 100 });
+  playback.started = false; playback.milestones.clear();
+});
 video.addEventListener('loadedmetadata', () => { video.classList.toggle('portrait', video.videoHeight > video.videoWidth); $('time').textContent = `0:00 / ${formatTime(video.duration)}`; $('seek').disabled = !Number.isFinite(video.duration) || video.duration <= 0; });
-video.addEventListener('timeupdate', () => { $('time').textContent = `${formatTime(video.currentTime)} / ${formatTime(video.duration)}`; $('seek').value = video.duration ? video.currentTime / video.duration * 1000 : 0; });
-video.addEventListener('waiting', () => { $('player-message').textContent = 'Carregando vídeo…'; }); video.addEventListener('playing', () => { $('player-message').textContent = ''; });
-video.addEventListener('error', () => { if (video.getAttribute('src')) $('player-message').textContent = 'Não foi possível carregar este vídeo. Tente baixar ou escolha outra recordação.'; });
+video.addEventListener('timeupdate', () => { trackProgress(); $('time').textContent = `${formatTime(video.currentTime)} / ${formatTime(video.duration)}`; $('seek').value = video.duration ? video.currentTime / video.duration * 1000 : 0; });
+video.addEventListener('waiting', () => { $('player-message').textContent = 'Carregando vídeo…'; }); video.addEventListener('playing', () => {
+  $('player-message').textContent = '';
+  if (!isCurrentMedia() || playback.active) return;
+  trackPlayback(playback.started ? 'video_resume' : 'video_start');
+  playback.started = true; playback.active = true;
+});
+video.addEventListener('error', () => { if (isCurrentMedia() || (playback && video.getAttribute('src') === pathURL(playback.item.file))) { trackPlayback('video_error', { error_source: 'media', error_code: video.error?.code || 0 }); } if (video.getAttribute('src')) $('player-message').textContent = 'Não foi possível carregar este vídeo. Tente baixar ou escolha outra recordação.'; });
 $('seek').addEventListener('input', () => { if (Number.isFinite(video.duration)) video.currentTime = Number($('seek').value) / 1000 * video.duration; });
 $('mute').addEventListener('click', () => { video.muted = !video.muted; $('mute').textContent = video.muted ? '×♪ Sem som' : '♪ Som ligado'; $('mute').setAttribute('aria-label', video.muted ? 'Ativar som' : 'Silenciar'); $('mute').setAttribute('aria-pressed', String(video.muted)); });
 $('fullscreen').addEventListener('click', async () => { try { if (document.fullscreenElement) await document.exitFullscreen(); else if (video.requestFullscreen) await video.requestFullscreen(); else if (video.webkitEnterFullscreen) video.webkitEnterFullscreen(); else toast('Use a opção de tela cheia do seu navegador.'); } catch { toast('Tela cheia indisponível neste navegador.'); } });
@@ -247,6 +310,6 @@ $('previous').addEventListener('click', () => openVideo(current - 1)); $('next')
 viewer.addEventListener('keydown', event => { if (event.target.matches('input')) return; if (event.key === 'ArrowRight') { event.preventDefault(); openVideo(current + 1); } if (event.key === 'ArrowLeft') { event.preventDefault(); openVideo(current - 1); } if (event.key === ' ' && !event.target.matches('button,a')) { event.preventDefault(); togglePlay(); } });
 let touchStart;
 $('stage').addEventListener('touchstart', event => { if (event.touches.length === 1) touchStart = { x: event.touches[0].clientX, y: event.touches[0].clientY }; }, { passive: true });
-$('stage').addEventListener('touchend', event => { if (!touchStart) return; const deltaX = event.changedTouches[0].clientX - touchStart.x; const deltaY = event.changedTouches[0].clientY - touchStart.y; if (Math.abs(deltaX) > 60 && Math.abs(deltaX) > Math.abs(deltaY) * 1.5) openVideo(current + (deltaX < 0 ? 1 : -1)); touchStart = null; }, { passive: true });
+$('stage').addEventListener('touchend', event => { if (!touchStart) return; const deltaX = event.changedTouches[0].clientX - touchStart.x; const deltaY = event.changedTouches[0].clientY - touchStart.y; if (Math.abs(deltaX) > 60 && Math.abs(deltaX) > Math.abs(deltaY) * 1.5) { trackPlayback('video_control', { control: deltaX < 0 ? 'swipe_next' : 'swipe_previous' }); openVideo(current + (deltaX < 0 ? 1 : -1)); } touchStart = null; }, { passive: true });
 $('stage').addEventListener('touchcancel', () => { touchStart = null; }, { passive: true });
 window.addEventListener('popstate', openFromURL); loadCatalog();
